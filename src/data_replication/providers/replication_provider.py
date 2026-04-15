@@ -3103,6 +3103,12 @@ class ReplicationProvider(BaseProvider):
 
     # ── ABAC replication methods ─────────────────────────────────────────
 
+    @staticmethod
+    def _quote_fn_name(full_name: str) -> str:
+        """Quote a fully-qualified function name as `catalog`.`schema`.`function`."""
+        parts = full_name.split(".")
+        return ".".join(f"`{p}`" for p in parts)
+
     def _uc_replicate_functions(
         self,
         schema_name: str,
@@ -3307,7 +3313,7 @@ class ReplicationProvider(BaseProvider):
             )
             input_cols = ", ".join(row_filter["input_column_names"])
 
-            query = f"ALTER TABLE {target_table} SET ROW FILTER `{target_fn}` ON ({input_cols})"
+            query = f"ALTER TABLE {target_table} SET ROW FILTER {self._quote_fn_name(target_fn)} ON ({input_cols})"
 
             self.logger.info(
                 f"Replicating row filter: {source_table} -> {target_table} (fn: {target_fn})",
@@ -3431,7 +3437,7 @@ class ReplicationProvider(BaseProvider):
                 using_clause = ""
                 if using_cols:
                     using_clause = f" USING COLUMNS ({', '.join(using_cols)})"
-                query = f"ALTER TABLE {target_table} ALTER COLUMN `{col_name}` SET MASK `{target_fn}`{using_clause}"
+                query = f"ALTER TABLE {target_table} ALTER COLUMN `{col_name}` SET MASK {self._quote_fn_name(target_fn)}{using_clause}"
 
                 try:
                     self.logger.info(

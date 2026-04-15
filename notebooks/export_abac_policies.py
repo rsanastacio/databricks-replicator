@@ -44,6 +44,11 @@ from databricks.sdk import WorkspaceClient
 
 w = WorkspaceClient()
 
+def quote_fn_name(full_name: str) -> str:
+    """Quote a fully-qualified function name as `catalog`.`schema`.`function`."""
+    parts = full_name.split(".")
+    return ".".join(f"`{p}`" for p in parts)
+
 # ── Discover schemas ──
 all_schemas = [s.name for s in w.schemas.list(catalog_name=source_catalog) if s.name not in ("information_schema", "default")]
 schemas_to_export = [s for s in all_schemas if s in schemas_filter] if schemas_filter else all_schemas
@@ -149,7 +154,7 @@ for schema_name in schemas_to_export:
         input_cols_str = ", ".join(input_cols)
 
         target_table = f"`{target_catalog}`.`{schema_name}`.`{tbl.name}`"
-        sql = f"ALTER TABLE {target_table} SET ROW FILTER `{target_fn}` ON ({input_cols_str});"
+        sql = f"ALTER TABLE {target_table} SET ROW FILTER {quote_fn_name(target_fn)} ON ({input_cols_str});"
 
         exported_row_filters.append({
             "source_table": f"{source_catalog}.{schema_name}.{tbl.name}",
@@ -196,7 +201,7 @@ for schema_name in schemas_to_export:
 
             target_table = f"`{target_catalog}`.`{schema_name}`.`{tbl.name}`"
             using_clause = f" USING COLUMNS ({', '.join(using_cols)})" if using_cols else ""
-            sql = f"ALTER TABLE {target_table} ALTER COLUMN `{col.name}` SET MASK `{target_fn}`{using_clause};"
+            sql = f"ALTER TABLE {target_table} ALTER COLUMN `{col.name}` SET MASK {quote_fn_name(target_fn)}{using_clause};"
 
             exported_column_masks.append({
                 "source_table": f"{source_catalog}.{schema_name}.{tbl.name}",
