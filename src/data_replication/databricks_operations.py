@@ -14,6 +14,7 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.catalog import (
     CatalogInfo,
     ExternalLocationInfo,
+    FunctionInfo,
     SchemaInfo,
     StorageCredentialInfo,
     VolumeInfo,
@@ -1670,3 +1671,110 @@ class DatabricksOperations:
             return created_warehouse.id, created_warehouse.name
         except Exception as e:
             raise Exception(f"Failed to create SQL warehouse: {str(e)}") from e
+
+    # ── ABAC / Function replication helpers ──────────────────────────────
+
+    def list_functions(
+        self, catalog_name: str, schema_name: str
+    ) -> List[FunctionInfo]:
+        """
+        List all user-defined functions in a schema.
+
+        Args:
+            catalog_name: Name of the catalog
+            schema_name: Name of the schema
+
+        Returns:
+            List of FunctionInfo objects
+        """
+        if not self.workspace_client:
+            raise Exception("WorkspaceClient is required for function operations")
+        try:
+            return list(
+                self.workspace_client.functions.list(
+                    catalog_name=catalog_name, schema_name=schema_name
+                )
+            )
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"Failed to list functions in {catalog_name}.{schema_name}: {e}")
+            return []
+
+    def get_function_ddl(self, full_function_name: str) -> str:
+        """
+        Get the CREATE FUNCTION DDL for a UDF using SHOW CREATE FUNCTION.
+
+        Args:
+            full_function_name: Fully-qualified function name (catalog.schema.function)
+
+        Returns:
+            CREATE FUNCTION DDL as a string
+        """
+        try:
+            ddl_df = self._execute_sql(
+                f"SHOW CREATE FUNCTION {full_function_name}",
+                f"get DDL for function {full_function_name}",
+            )
+            return "\n".join(row[0] for row in ddl_df.collect())
+        except Exception as e:
+            raise Exception(
+                f"Failed to get CREATE FUNCTION DDL for {full_function_name}: {e}"
+            ) from e
+
+    def get_table_row_filter(self, table_name: str) -> Optional[dict]:
+        """
+        Get the row filter configuration for a table via the SDK.
+
+        Args:
+            table_name: Full table name (catalog.schema.table) without backticks
+
+        Returns:
+            Dict with keys 'function_name' and 'input_column_names', or None
+        """
+        if not self.workspace_client:
+            raise Exception("WorkspaceClient is required for row filter operations")
+        try:
+            table_info = self.workspace_client.tables.get(
+                full_name=table_name.replace("`", "")
+            )
+            rf = table_info.row_filter
+            if rf and rf.function_name:
+                return {
+                    "function_name": rf.function_name,
+                    "input_column_names": list(rf.input_column_names) if rf.input_column_names else [],
+                }
+            return None
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"Failed to get row filter for {table_name}: {e}")
+            return None
+
+    def get_table_column_masks(self, table_name: str) -> List[dict]:
+        """
+        Get column mask configurations for all columns in a table via the SDK.
+
+        Args:
+            table_name: Full table name (catalog.schema.table) without backticks
+
+        Returns:
+            List of dicts with keys 'column_name', 'function_name', 'using_column_names'
+        """
+        if not self.workspace_client:
+            raise Exception("WorkspaceClient is required for column mask operations")
+        masks = []
+        try:
+            table_info = self.workspace_client.tables.get(
+                full_name=table_name.replace("`", "")
+            )
+            if table_info.columns:
+                for col in table_info.columns:
+                    if col.mask and col.mask.function_name:
+                        masks.append({
+                            "column_name": col.name,
+                            "function_name": col.mask.function_name,
+                            "using_column_names": list(col.mask.using_column_names) if col.mask.using_column_names else [],
+                        })
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"Failed to get column masks for {table_name}: {e}")
+        return masks

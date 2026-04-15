@@ -573,6 +573,8 @@ class BaseProvider(ABC):
                             UCObjectType.TABLE_COMMENT,
                             UCObjectType.MATERIALIZED_VIEW,
                             UCObjectType.STREAMING_TABLE,
+                            UCObjectType.ROW_FILTER,
+                            UCObjectType.COLUMN_MASK,
                         ]
                     )
                 )

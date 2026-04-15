@@ -90,6 +90,9 @@ class UCObjectType(str, Enum):
     EXTERNAL_LOCATION = "external_location"
     MATERIALIZED_VIEW = "materialized_view"
     STREAMING_TABLE = "streaming_table"
+    FUNCTION = "function"
+    ROW_FILTER = "row_filter"
+    COLUMN_MASK = "column_mask"
     ALL = "all"
 
 

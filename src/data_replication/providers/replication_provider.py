@@ -223,6 +223,39 @@ class ReplicationProvider(BaseProvider):
                 self.catalog_config.catalog_name, schema_config.schema_name
             )
 
+        # Replicate functions before tables (ABAC policies depend on UDFs)
+        if self.catalog_config.uc_object_types and (
+            UCObjectType.FUNCTION in self.catalog_config.uc_object_types
+            or UCObjectType.ALL in self.catalog_config.uc_object_types
+        ):
+            # Build a minimal table_config to pass replication settings to function replication
+            if schema_config.tables:
+                # Use the first table's config for retry/replication settings
+                first_table = schema_config.tables[0]
+                if isinstance(first_table, str):
+                    from ..config.models import TableConfig as TC
+                    func_table_config = TC(
+                        table_name="__functions__",
+                        replication_config=schema_config.replication_config,
+                        retry=schema_config.retry if hasattr(schema_config, 'retry') else None,
+                    )
+                else:
+                    func_table_config = TableConfig(
+                        table_name="__functions__",
+                        replication_config=first_table.replication_config or schema_config.replication_config,
+                        retry=first_table.retry,
+                    )
+            else:
+                func_table_config = TableConfig(
+                    table_name="__functions__",
+                    replication_config=schema_config.replication_config,
+                )
+            func_results = self._uc_replicate_functions(
+                schema_config.schema_name, func_table_config
+            )
+            if func_results:
+                self.audit_logger.log_results(func_results)
+
         return super().process_schema(schema_config)
 
     def process_table(
@@ -304,6 +337,26 @@ class ReplicationProvider(BaseProvider):
                 or UCObjectType.ALL in self.catalog_config.uc_object_types
             ):
                 result = self._uc_replicate_column_tags(
+                    schema_name,
+                    table_config,
+                )
+                results.extend(result)
+            # ABAC: Row Filters (applied after DDL, requires functions to exist)
+            if (
+                UCObjectType.ROW_FILTER in self.catalog_config.uc_object_types
+                or UCObjectType.ALL in self.catalog_config.uc_object_types
+            ):
+                result = self._uc_replicate_row_filters(
+                    schema_name,
+                    table_config,
+                )
+                results.extend(result)
+            # ABAC: Column Masks (applied after DDL, requires functions to exist)
+            if (
+                UCObjectType.COLUMN_MASK in self.catalog_config.uc_object_types
+                or UCObjectType.ALL in self.catalog_config.uc_object_types
+            ):
+                result = self._uc_replicate_column_masks(
                     schema_name,
                     table_config,
                 )
@@ -3047,3 +3100,409 @@ class ReplicationProvider(BaseProvider):
         ) = replication_operation(step1_query)
 
         return result, last_exception, attempt, max_attempts, step1_query
+
+    # ── ABAC replication methods ─────────────────────────────────────────
+
+    def _uc_replicate_functions(
+        self,
+        schema_name: str,
+        table_config: TableConfig,
+    ) -> List[RunResult]:
+        """
+        Replicate all user-defined functions in a schema from source to target.
+
+        Functions must be replicated before row filters and column masks because
+        those ABAC policies reference UDFs.
+
+        Args:
+            schema_name: Schema name
+            table_config: TableConfig with replication settings
+        Returns:
+            List of RunResult objects
+        """
+        start_time = datetime.now(timezone.utc)
+        run_results = []
+        replication_config = table_config.replication_config
+        source_catalog = replication_config.source_catalog
+        target_catalog = self.catalog_config.catalog_name
+        max_attempts = table_config.retry.max_attempts
+
+        @retry_with_logging(table_config.retry, self.logger)
+        def replication_operation(query: str):
+            self.logger.debug(
+                f"Executing function replication query: {query}",
+                extra={"run_id": self.run_id, "operation": "replication"},
+            )
+            self.target_spark.sql(query)
+            return True
+
+        try:
+            functions = self.source_dbops.list_functions(source_catalog, schema_name)
+            if not functions:
+                self.logger.info(
+                    f"No functions found in {source_catalog}.{schema_name}",
+                    extra={"run_id": self.run_id, "operation": "replication"},
+                )
+                return run_results
+
+            for func_info in functions:
+                func_start = datetime.now(timezone.utc)
+                func_name = func_info.name
+                source_full_name = f"`{source_catalog}`.`{schema_name}`.`{func_name}`"
+                target_full_name = f"`{target_catalog}`.`{schema_name}`.`{func_name}`"
+
+                try:
+                    self.logger.info(
+                        f"Replicating function: {source_full_name} -> {target_full_name}",
+                        extra={"run_id": self.run_id, "operation": "replication"},
+                    )
+                    # Get DDL from source
+                    ddl = self.source_dbops.get_function_ddl(source_full_name)
+
+                    # Replace source catalog with target catalog in the DDL
+                    target_ddl = ddl.replace(
+                        f"`{source_catalog}`", f"`{target_catalog}`"
+                    )
+                    # Also handle unquoted references
+                    target_ddl = target_ddl.replace(
+                        f"{source_catalog}.{schema_name}", f"{target_catalog}.{schema_name}"
+                    )
+                    # Use CREATE OR REPLACE to be idempotent
+                    target_ddl = target_ddl.replace(
+                        "CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1
+                    )
+
+                    result, last_exception, attempt, _ = replication_operation(target_ddl)
+
+                    func_end = datetime.now(timezone.utc)
+                    duration = (func_end - func_start).total_seconds()
+
+                    if result:
+                        run_results.append(
+                            RunResult(
+                                operation_type="uc_replication",
+                                catalog_name=target_catalog,
+                                schema_name=schema_name,
+                                object_name=func_name,
+                                object_type="function",
+                                status="success",
+                                start_time=func_start.isoformat(),
+                                end_time=func_end.isoformat(),
+                                duration_seconds=duration,
+                                details={
+                                    "source_object": source_full_name,
+                                    "target_object": target_full_name,
+                                },
+                                attempt_number=attempt,
+                                max_attempts=max_attempts,
+                            )
+                        )
+                    else:
+                        run_results.append(
+                            RunResult(
+                                operation_type="uc_replication",
+                                catalog_name=target_catalog,
+                                schema_name=schema_name,
+                                object_name=func_name,
+                                object_type="function",
+                                status="failed",
+                                start_time=func_start.isoformat(),
+                                end_time=func_end.isoformat(),
+                                duration_seconds=duration,
+                                error_message=str(last_exception) if last_exception else "Unknown error",
+                                details={
+                                    "source_object": source_full_name,
+                                    "target_object": target_full_name,
+                                },
+                                attempt_number=attempt,
+                                max_attempts=max_attempts,
+                            )
+                        )
+                except Exception as e:
+                    func_end = datetime.now(timezone.utc)
+                    duration = (func_end - func_start).total_seconds()
+                    self.logger.error(
+                        f"Failed to replicate function {source_full_name}: {e}",
+                        extra={"run_id": self.run_id, "operation": "replication"},
+                    )
+                    run_results.append(
+                        RunResult(
+                            operation_type="uc_replication",
+                            catalog_name=target_catalog,
+                            schema_name=schema_name,
+                            object_name=func_name,
+                            object_type="function",
+                            status="failed",
+                            start_time=func_start.isoformat(),
+                            end_time=func_end.isoformat(),
+                            duration_seconds=duration,
+                            error_message=str(e),
+                            details={
+                                "source_object": source_full_name,
+                                "target_object": target_full_name,
+                            },
+                            attempt_number=1,
+                            max_attempts=max_attempts,
+                        )
+                    )
+        except Exception as e:
+            end_time = datetime.now(timezone.utc)
+            duration = (end_time - start_time).total_seconds()
+            self.logger.error(
+                f"Failed to list functions in {source_catalog}.{schema_name}: {e}",
+                extra={"run_id": self.run_id, "operation": "replication"},
+            )
+
+        return run_results
+
+    def _uc_replicate_row_filters(
+        self,
+        schema_name: str,
+        table_config: TableConfig,
+    ) -> List[RunResult]:
+        """
+        Replicate row filter from source table to target table.
+
+        Reads the row filter binding from the source table via the SDK and
+        applies it to the target table using ALTER TABLE ... SET ROW FILTER.
+
+        Args:
+            schema_name: Schema name
+            table_config: TableConfig with replication settings
+        Returns:
+            List of RunResult objects
+        """
+        start_time = datetime.now(timezone.utc)
+        run_results = []
+        table_name = table_config.table_name
+        replication_config = table_config.replication_config
+        source_catalog = replication_config.source_catalog
+        target_catalog = self.catalog_config.catalog_name
+        source_table = f"{source_catalog}.{schema_name}.{table_name}"
+        target_table = f"`{target_catalog}`.`{schema_name}`.`{table_name}`"
+        max_attempts = table_config.retry.max_attempts
+
+        @retry_with_logging(table_config.retry, self.logger)
+        def replication_operation(query: str):
+            self.logger.debug(
+                f"Executing row filter replication query: {query}",
+                extra={"run_id": self.run_id, "operation": "replication"},
+            )
+            self.target_spark.sql(query)
+            return True
+
+        try:
+            row_filter = self.source_dbops.get_table_row_filter(source_table)
+            if not row_filter:
+                self.logger.debug(
+                    f"No row filter on source table {source_table}",
+                    extra={"run_id": self.run_id, "operation": "replication"},
+                )
+                return run_results
+
+            # Map function name from source catalog to target catalog
+            source_fn = row_filter["function_name"]
+            target_fn = source_fn.replace(
+                f"{source_catalog}.", f"{target_catalog}.", 1
+            )
+            input_cols = ", ".join(row_filter["input_column_names"])
+
+            query = f"ALTER TABLE {target_table} SET ROW FILTER `{target_fn}` ON ({input_cols})"
+
+            self.logger.info(
+                f"Replicating row filter: {source_table} -> {target_table} (fn: {target_fn})",
+                extra={"run_id": self.run_id, "operation": "replication"},
+            )
+
+            result, last_exception, attempt, _ = replication_operation(query)
+
+            end_time = datetime.now(timezone.utc)
+            duration = (end_time - start_time).total_seconds()
+
+            status = "success" if result else "failed"
+            run_results.append(
+                RunResult(
+                    operation_type="uc_replication",
+                    catalog_name=target_catalog,
+                    schema_name=schema_name,
+                    object_name=table_name,
+                    object_type="row_filter",
+                    status=status,
+                    start_time=start_time.isoformat(),
+                    end_time=end_time.isoformat(),
+                    duration_seconds=duration,
+                    error_message=str(last_exception) if last_exception and not result else None,
+                    details={
+                        "source_table": source_table,
+                        "target_table": target_table,
+                        "function_name": target_fn,
+                        "input_columns": row_filter["input_column_names"],
+                        "query": query,
+                    },
+                    attempt_number=attempt,
+                    max_attempts=max_attempts,
+                )
+            )
+        except Exception as e:
+            end_time = datetime.now(timezone.utc)
+            duration = (end_time - start_time).total_seconds()
+            self.logger.error(
+                f"Failed to replicate row filter for {source_table}: {e}",
+                extra={"run_id": self.run_id, "operation": "replication"},
+            )
+            run_results.append(
+                RunResult(
+                    operation_type="uc_replication",
+                    catalog_name=target_catalog,
+                    schema_name=schema_name,
+                    object_name=table_name,
+                    object_type="row_filter",
+                    status="failed",
+                    start_time=start_time.isoformat(),
+                    end_time=end_time.isoformat(),
+                    duration_seconds=duration,
+                    error_message=str(e),
+                    details={
+                        "source_table": source_table,
+                        "target_table": target_table,
+                    },
+                    attempt_number=1,
+                    max_attempts=max_attempts,
+                )
+            )
+
+        return run_results
+
+    def _uc_replicate_column_masks(
+        self,
+        schema_name: str,
+        table_config: TableConfig,
+    ) -> List[RunResult]:
+        """
+        Replicate column masks from source table to target table.
+
+        Reads all column mask bindings from the source table via the SDK and
+        applies them to the target table using ALTER TABLE ... ALTER COLUMN ... SET MASK.
+
+        Args:
+            schema_name: Schema name
+            table_config: TableConfig with replication settings
+        Returns:
+            List of RunResult objects
+        """
+        start_time = datetime.now(timezone.utc)
+        run_results = []
+        table_name = table_config.table_name
+        replication_config = table_config.replication_config
+        source_catalog = replication_config.source_catalog
+        target_catalog = self.catalog_config.catalog_name
+        source_table = f"{source_catalog}.{schema_name}.{table_name}"
+        target_table = f"`{target_catalog}`.`{schema_name}`.`{table_name}`"
+        max_attempts = table_config.retry.max_attempts
+
+        @retry_with_logging(table_config.retry, self.logger)
+        def replication_operation(query: str):
+            self.logger.debug(
+                f"Executing column mask replication query: {query}",
+                extra={"run_id": self.run_id, "operation": "replication"},
+            )
+            self.target_spark.sql(query)
+            return True
+
+        try:
+            column_masks = self.source_dbops.get_table_column_masks(source_table)
+            if not column_masks:
+                self.logger.debug(
+                    f"No column masks on source table {source_table}",
+                    extra={"run_id": self.run_id, "operation": "replication"},
+                )
+                return run_results
+
+            for mask in column_masks:
+                mask_start = datetime.now(timezone.utc)
+                col_name = mask["column_name"]
+                source_fn = mask["function_name"]
+                target_fn = source_fn.replace(
+                    f"{source_catalog}.", f"{target_catalog}.", 1
+                )
+                using_cols = mask["using_column_names"]
+
+                # Build the ALTER TABLE statement
+                using_clause = ""
+                if using_cols:
+                    using_clause = f" USING COLUMNS ({', '.join(using_cols)})"
+                query = f"ALTER TABLE {target_table} ALTER COLUMN `{col_name}` SET MASK `{target_fn}`{using_clause}"
+
+                try:
+                    self.logger.info(
+                        f"Replicating column mask: {source_table}.{col_name} -> {target_table}.{col_name} (fn: {target_fn})",
+                        extra={"run_id": self.run_id, "operation": "replication"},
+                    )
+
+                    result, last_exception, attempt, _ = replication_operation(query)
+
+                    mask_end = datetime.now(timezone.utc)
+                    duration = (mask_end - mask_start).total_seconds()
+
+                    status = "success" if result else "failed"
+                    run_results.append(
+                        RunResult(
+                            operation_type="uc_replication",
+                            catalog_name=target_catalog,
+                            schema_name=schema_name,
+                            object_name=f"{table_name}.{col_name}",
+                            object_type="column_mask",
+                            status=status,
+                            start_time=mask_start.isoformat(),
+                            end_time=mask_end.isoformat(),
+                            duration_seconds=duration,
+                            error_message=str(last_exception) if last_exception and not result else None,
+                            details={
+                                "source_table": source_table,
+                                "target_table": target_table,
+                                "column_name": col_name,
+                                "function_name": target_fn,
+                                "using_columns": using_cols,
+                                "query": query,
+                            },
+                            attempt_number=attempt,
+                            max_attempts=max_attempts,
+                        )
+                    )
+                except Exception as e:
+                    mask_end = datetime.now(timezone.utc)
+                    duration = (mask_end - mask_start).total_seconds()
+                    self.logger.error(
+                        f"Failed to replicate column mask for {source_table}.{col_name}: {e}",
+                        extra={"run_id": self.run_id, "operation": "replication"},
+                    )
+                    run_results.append(
+                        RunResult(
+                            operation_type="uc_replication",
+                            catalog_name=target_catalog,
+                            schema_name=schema_name,
+                            object_name=f"{table_name}.{col_name}",
+                            object_type="column_mask",
+                            status="failed",
+                            start_time=mask_start.isoformat(),
+                            end_time=mask_end.isoformat(),
+                            duration_seconds=duration,
+                            error_message=str(e),
+                            details={
+                                "source_table": source_table,
+                                "target_table": target_table,
+                                "column_name": col_name,
+                            },
+                            attempt_number=1,
+                            max_attempts=max_attempts,
+                        )
+                    )
+        except Exception as e:
+            end_time = datetime.now(timezone.utc)
+            duration = (end_time - start_time).total_seconds()
+            self.logger.error(
+                f"Failed to get column masks for {source_table}: {e}",
+                extra={"run_id": self.run_id, "operation": "replication"},
+            )
+
+        return run_results
