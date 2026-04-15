@@ -93,11 +93,31 @@ for fn in sorted(referenced_functions):
 # COMMAND ----------
 
 # Second pass: export DDL only for referenced functions
+# Uses DESCRIBE FUNCTION EXTENDED to reconstruct DDL
+# (SHOW CREATE FUNCTION is not supported on serverless / Spark Connect)
 print("\nExporting function DDLs...")
 for fn_full_name in sorted(referenced_functions):
     try:
-        ddl_rows = spark.sql(f"SHOW CREATE FUNCTION `{fn_full_name}`").collect()
-        ddl = "\n".join(row[0] for row in ddl_rows)
+        quoted_fn = quote_fn_name(fn_full_name)
+        desc_rows = spark.sql(f"DESCRIBE FUNCTION EXTENDED {quoted_fn}").collect()
+
+        # Parse DESCRIBE output to reconstruct DDL
+        fn_meta = {}
+        for row in desc_rows:
+            line = row[0] if row else ""
+            for key in ["Function:", "Input:", "Returns:", "Body:"]:
+                if line.startswith(key):
+                    fn_meta[key.rstrip(":")] = line[len(key):].strip()
+
+        body = fn_meta.get("Body", "")
+        input_params = fn_meta.get("Input", "")
+        returns = fn_meta.get("Returns", "STRING")
+
+        if not body:
+            raise ValueError(f"No body found in DESCRIBE for {fn_full_name}")
+
+        # Reconstruct DDL
+        ddl = f"CREATE FUNCTION {quoted_fn}({input_params})\nRETURNS {returns}\nRETURN\n  {body}"
 
         # Generate target DDL
         target_ddl = ddl.replace(f"`{source_catalog}`", f"`{target_catalog}`")
