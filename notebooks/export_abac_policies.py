@@ -5,9 +5,17 @@
 # MAGIC Exports ABAC policies, legacy row filters, column masks, and their UDFs from a source catalog.
 # MAGIC Generates a portable JSON manifest + SQL script for import into another metastore.
 # MAGIC
-# MAGIC **Supports two modes:**
-# MAGIC - **ABAC Policies** (new framework) — exported via Unity Catalog REST API
-# MAGIC - **Legacy RLS/CLS** (row filters + column masks via ALTER TABLE) — exported via SDK table metadata
+# MAGIC **Export Modes:**
+# MAGIC | Mode | What it exports | How |
+# MAGIC |------|----------------|-----|
+# MAGIC | `all` | ABAC policies + legacy row filters/column masks + UDFs | Combines both approaches below |
+# MAGIC | `policies_only` | Only ABAC policies (new framework) at catalog, schema, and table levels | Unity Catalog REST API (`/api/2.1/unity-catalog/effective-policies`) |
+# MAGIC | `legacy_only` | Only legacy row filters and column masks bound directly to tables | SDK table metadata (`table_info.row_filter`, `column_info.mask`) + `ALTER TABLE` SQL |
+# MAGIC
+# MAGIC **When to use each mode:**
+# MAGIC - `all` — Default. Use when you're not sure which mechanism the source uses, or when it uses both.
+# MAGIC - `policies_only` — Use when ABAC policies were created via the Policies UI or REST API (visible in the **Policies** tab of Catalog Explorer).
+# MAGIC - `legacy_only` — Use when row filters/column masks were applied via `ALTER TABLE ... SET ROW FILTER` / `SET MASK` (visible in the **Details** tab of Catalog Explorer).
 # MAGIC
 # MAGIC **Parameters:**
 # MAGIC | Widget | Description | Example |
@@ -17,8 +25,9 @@
 # MAGIC | `schemas` | Comma-separated schemas (empty = all) | `schema1,schema2` |
 # MAGIC | `output_volume` | UC Volume for output files | `my_catalog.my_schema.exports` |
 # MAGIC | `export_mode` | What to export: `all`, `policies_only`, `legacy_only` | `all` |
-# MAGIC | `apply_to_target` | Auto-apply policies to target: `true` / `false` | `false` |
+# MAGIC | `apply_to_target` | Auto-apply exported policies to target catalog | `false` |
 # MAGIC | `tables_filter` | Comma-separated tables (empty = all in schema) | `table1,table2` |
+# MAGIC | `table_name_map` | Remap table names on import (`source:target` pairs) | `tbl_origin:tbl_target` |
 
 # COMMAND ----------
 
