@@ -202,7 +202,7 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Export Legacy Row Filters & Column Masks
+# MAGIC ## 2. Export RLS/CLS (Row Filters & Column Masks)
 
 # COMMAND ----------
 
@@ -213,7 +213,7 @@ row_filter_sqls = []
 column_mask_sqls = []
 
 if export_mode in ("all", "rls_cls_functions"):
-    print("Exporting legacy row filters & column masks...")
+    print("Exporting RLS/CLS (row filters & column masks)...")
     for schema_name in schemas_to_export:
         for tbl in schema_tables[schema_name]:
             full_name = f"{source_catalog}.{schema_name}.{tbl.name}"
@@ -267,8 +267,8 @@ if export_mode in ("all", "rls_cls_functions"):
                     column_mask_sqls.append(sql)
                     print(f"  COL MASK:   {full_name}.{col.name} -> {target_full}")
 
-    print(f"\nLegacy row filters: {len(exported_row_filters)}")
-    print(f"Legacy column masks: {len(exported_column_masks)}")
+    print(f"\nRLS/CLS row filters: {len(exported_row_filters)}")
+    print(f"RLS/CLS column masks: {len(exported_column_masks)}")
     print(f"Referenced functions: {len(referenced_functions)}")
 else:
     print("Skipping legacy RLS/CLS (export_mode = policies_only)")
@@ -357,8 +357,8 @@ print(f"Schemas:           {len(schemas_to_export)}")
 print(f"Tables scanned:    {total_tables}")
 print(f"Export mode:       {export_mode}")
 print(f"ABAC Policies:     {len(exported_policies)}")
-print(f"Legacy Row Filters:{len(exported_row_filters)}")
-print(f"Legacy Col Masks:  {len(exported_column_masks)}")
+print(f"RLS Row Filters:{len(exported_row_filters)}")
+print(f"CLS Col Masks:  {len(exported_column_masks)}")
 print(f"Functions (UDFs):  {len(function_ddls)}")
 print("=" * 60)
 
@@ -455,14 +455,14 @@ manifest = {
     "tables_filter": tables_filter or "ALL",
     "functions": exported_functions,
     "abac_policies": exported_policies,
-    "legacy_row_filters": exported_row_filters,
-    "legacy_column_masks": exported_column_masks,
+    "rls_row_filters": exported_row_filters,
+    "cls_column_masks": exported_column_masks,
     "applied_results": applied_results if apply_to_target else [],
     "stats": {
         "functions_count": len(function_ddls),
         "abac_policies_count": len(exported_policies),
-        "legacy_row_filters_count": len(exported_row_filters),
-        "legacy_column_masks_count": len(exported_column_masks),
+        "rls_row_filters_count": len(exported_row_filters),
+        "cls_column_masks_count": len(exported_column_masks),
     },
 }
 
