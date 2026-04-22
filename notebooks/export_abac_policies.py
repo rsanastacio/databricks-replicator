@@ -34,6 +34,7 @@ dbutils.widgets.text("output_volume", "", "Output Volume (catalog.schema.volume)
 dbutils.widgets.dropdown("export_mode", "all", ["all", "policies_only", "legacy_only"], "Export Mode")
 dbutils.widgets.dropdown("apply_to_target", "false", ["true", "false"], "Apply to Target")
 dbutils.widgets.text("tables_filter", "", "Tables Filter (comma-separated, empty = all)")
+dbutils.widgets.text("table_name_map", "", "Table Name Map (source:target, e.g. tbl_a:tbl_b)")
 
 source_catalog = dbutils.widgets.get("source_catalog")
 target_catalog = dbutils.widgets.get("target_catalog")
@@ -43,6 +44,15 @@ export_mode = dbutils.widgets.get("export_mode")
 apply_to_target = dbutils.widgets.get("apply_to_target") == "true"
 tables_filter = [t.strip() for t in dbutils.widgets.get("tables_filter").split(",") if t.strip()]
 
+# Parse table name map (source_table:target_table pairs)
+table_name_map = {}
+raw_map = dbutils.widgets.get("table_name_map")
+if raw_map.strip():
+    for pair in raw_map.split(","):
+        parts = pair.strip().split(":")
+        if len(parts) == 2:
+            table_name_map[parts[0].strip()] = parts[1].strip()
+
 assert source_catalog, "source_catalog is required"
 assert target_catalog, "target_catalog is required"
 assert output_volume, "output_volume is required"
@@ -51,6 +61,7 @@ print(f"Source:          {source_catalog}")
 print(f"Target:          {target_catalog}")
 print(f"Schemas:         {schemas_filter or 'ALL'}")
 print(f"Tables:          {tables_filter or 'ALL'}")
+print(f"Table name map:  {table_name_map or 'NONE (same names)'}")
 print(f"Export mode:     {export_mode}")
 print(f"Apply to target: {apply_to_target}")
 print(f"Output:          /Volumes/{output_volume.replace('.', '/')}/")
@@ -76,6 +87,13 @@ def quote_fn_name(full_name: str) -> str:
 def remap_catalog(name: str) -> str:
     """Replace source catalog with target catalog in a fully-qualified name."""
     return name.replace(f"{source_catalog}.", f"{target_catalog}.", 1)
+
+def remap_table(full_name: str) -> str:
+    """Remap catalog and optionally table name using table_name_map."""
+    remapped = remap_catalog(full_name)
+    for src_tbl, tgt_tbl in table_name_map.items():
+        remapped = remapped.replace(f".{src_tbl}", f".{tgt_tbl}")
+    return remapped
 
 # COMMAND ----------
 
@@ -116,43 +134,59 @@ print(f"\nTotal tables to scan: {total_tables}")
 # COMMAND ----------
 
 exported_policies = []
+seen_policy_ids = set()
+
+def _fetch_policies(securable_type: str, securable_full_name: str, label: str):
+    """Fetch ABAC policies for a given securable (CATALOG, SCHEMA, or TABLE)."""
+    fetched = []
+    try:
+        r = w.api_client.do(
+            "GET", "/api/2.1/unity-catalog/effective-policies",
+            query={"securable_type": securable_type, "securable_full_name": securable_full_name}
+        )
+        fetched = r.get("policies", [])
+    except Exception:
+        try:
+            r = w.api_client.do(
+                "GET", "/api/2.1/unity-catalog/policies",
+                query={"securable_type": securable_type, "securable_full_name": securable_full_name}
+            )
+            fetched = r.get("policies", [])
+        except Exception:
+            pass
+    # Deduplicate by policy id
+    for p in fetched:
+        pid = p.get("id", "")
+        if pid and pid in seen_policy_ids:
+            continue
+        if pid:
+            seen_policy_ids.add(pid)
+        p["_source_securable"] = securable_full_name
+        p["_source_securable_type"] = securable_type
+        p["_target_securable"] = remap_table(securable_full_name)
+        exported_policies.append(p)
+        print(f"  [{securable_type}] {securable_full_name}: {p.get('name','?')} ({p.get('policy_type','?')})")
 
 if export_mode in ("all", "policies_only"):
     print("Exporting ABAC policies via REST API...")
+
+    # Level 1: Catalog-level policies
+    print(f"\n-- Catalog: {source_catalog}")
+    _fetch_policies("CATALOG", source_catalog, f"catalog:{source_catalog}")
+
+    # Level 2: Schema-level policies
+    for schema_name in schemas_to_export:
+        full_schema = f"{source_catalog}.{schema_name}"
+        print(f"\n-- Schema: {full_schema}")
+        _fetch_policies("SCHEMA", full_schema, f"schema:{full_schema}")
+
+    # Level 3: Table-level policies
     for schema_name in schemas_to_export:
         for tbl in schema_tables[schema_name]:
             full_name = f"{source_catalog}.{schema_name}.{tbl.name}"
-            try:
-                policies = w.api_client.do(
-                    "GET", "/api/2.1/unity-catalog/effective-policies",
-                    query={"securable_type": "TABLE", "securable_full_name": full_name}
-                )
-                policy_list = policies.get("policies", [])
-                if not policy_list:
-                    continue
-                for p in policy_list:
-                    p["_source_table"] = full_name
-                    p["_target_table"] = remap_catalog(full_name)
-                    exported_policies.append(p)
-                    ptype = p.get("policy_type", "?")
-                    pname = p.get("name", "?")
-                    print(f"  {full_name}: {pname} ({ptype})")
-            except Exception as e:
-                # effective-policies may not be available, try listing
-                try:
-                    policies = w.api_client.do(
-                        "GET", "/api/2.1/unity-catalog/policies",
-                        query={"securable_type": "TABLE", "securable_full_name": full_name}
-                    )
-                    for p in policies.get("policies", []):
-                        p["_source_table"] = full_name
-                        p["_target_table"] = remap_catalog(full_name)
-                        exported_policies.append(p)
-                        print(f"  {full_name}: {p.get('name','?')} ({p.get('policy_type','?')})")
-                except Exception:
-                    pass  # ABAC policy API not available on this workspace
+            _fetch_policies("TABLE", full_name, f"table:{full_name}")
 
-    print(f"\nExported {len(exported_policies)} ABAC policies")
+    print(f"\nExported {len(exported_policies)} ABAC policies (catalog + schema + table levels)")
 else:
     print("Skipping ABAC policies (export_mode = legacy_only)")
 
@@ -186,18 +220,19 @@ if export_mode in ("all", "legacy_only"):
                 referenced_functions.add(rf.function_name)
                 target_fn = remap_catalog(rf.function_name)
                 input_cols = list(rf.input_column_names) if rf.input_column_names else []
-                target_table = f"`{target_catalog}`.`{schema_name}`.`{tbl.name}`"
-                sql = f"ALTER TABLE {target_table} SET ROW FILTER {quote_fn_name(target_fn)} ON ({', '.join(input_cols)});"
+                target_full = remap_table(full_name)
+                target_table_quoted = quote_fn_name(target_full)
+                sql = f"ALTER TABLE {target_table_quoted} SET ROW FILTER {quote_fn_name(target_fn)} ON ({', '.join(input_cols)});"
                 exported_row_filters.append({
                     "source_table": full_name,
-                    "target_table": remap_catalog(full_name),
+                    "target_table": target_full,
                     "function_name": rf.function_name,
                     "target_function_name": target_fn,
                     "input_column_names": input_cols,
                     "sql": sql,
                 })
                 row_filter_sqls.append(sql)
-                print(f"  ROW FILTER: {full_name} -> {rf.function_name}")
+                print(f"  ROW FILTER: {full_name} -> {target_full}")
 
             # Column masks
             if table_info.columns:
@@ -207,12 +242,13 @@ if export_mode in ("all", "legacy_only"):
                     referenced_functions.add(col.mask.function_name)
                     target_fn = remap_catalog(col.mask.function_name)
                     using_cols = list(col.mask.using_column_names) if col.mask.using_column_names else []
-                    target_table = f"`{target_catalog}`.`{schema_name}`.`{tbl.name}`"
+                    target_full = remap_table(full_name)
+                    target_table_quoted = quote_fn_name(target_full)
                     using_clause = f" USING COLUMNS ({', '.join(using_cols)})" if using_cols else ""
-                    sql = f"ALTER TABLE {target_table} ALTER COLUMN `{col.name}` SET MASK {quote_fn_name(target_fn)}{using_clause};"
+                    sql = f"ALTER TABLE {target_table_quoted} ALTER COLUMN `{col.name}` SET MASK {quote_fn_name(target_fn)}{using_clause};"
                     exported_column_masks.append({
                         "source_table": full_name,
-                        "target_table": remap_catalog(full_name),
+                        "target_table": target_full,
                         "column_name": col.name,
                         "function_name": col.mask.function_name,
                         "target_function_name": target_fn,
@@ -220,7 +256,7 @@ if export_mode in ("all", "legacy_only"):
                         "sql": sql,
                     })
                     column_mask_sqls.append(sql)
-                    print(f"  COL MASK:   {full_name}.{col.name} -> {col.mask.function_name}")
+                    print(f"  COL MASK:   {full_name}.{col.name} -> {target_full}")
 
     print(f"\nLegacy row filters: {len(exported_row_filters)}")
     print(f"Legacy column masks: {len(exported_column_masks)}")
@@ -363,9 +399,9 @@ if apply_to_target:
     for p in exported_policies:
         try:
             policy_body = {k: v for k, v in p.items() if not k.startswith("_")}
-            # Remap securable to target
+            # Remap securable to target (catalog + table name)
             if "on_securable_fullname" in policy_body:
-                policy_body["on_securable_fullname"] = remap_catalog(policy_body["on_securable_fullname"])
+                policy_body["on_securable_fullname"] = remap_table(policy_body["on_securable_fullname"])
             # Remap function names
             for section in ("row_filter", "column_mask"):
                 if section in policy_body and "function_name" in policy_body[section]:
