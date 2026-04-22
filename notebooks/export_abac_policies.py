@@ -10,12 +10,12 @@
 # MAGIC |------|----------------|-----|
 # MAGIC | `all` | ABAC policies + legacy row filters/column masks + UDFs | Combines both approaches below |
 # MAGIC | `policies_only` | Only ABAC policies (new framework) at catalog, schema, and table levels | Unity Catalog REST API (`/api/2.1/unity-catalog/effective-policies`) |
-# MAGIC | `legacy_only` | Only legacy row filters and column masks bound directly to tables | SDK table metadata (`table_info.row_filter`, `column_info.mask`) + `ALTER TABLE` SQL |
+# MAGIC | `rls_cls_functions` | Only legacy row filters and column masks bound directly to tables | SDK table metadata (`table_info.row_filter`, `column_info.mask`) + `ALTER TABLE` SQL |
 # MAGIC
 # MAGIC **When to use each mode:**
 # MAGIC - `all` — Default. Use when you're not sure which mechanism the source uses, or when it uses both.
 # MAGIC - `policies_only` — Use when ABAC policies were created via the Policies UI or REST API (visible in the **Policies** tab of Catalog Explorer).
-# MAGIC - `legacy_only` — Use when row filters/column masks were applied via `ALTER TABLE ... SET ROW FILTER` / `SET MASK` (visible in the **Details** tab of Catalog Explorer).
+# MAGIC - `rls_cls_functions` — Use when row filters/column masks were applied via `ALTER TABLE ... SET ROW FILTER` / `SET MASK` (visible in the **Details** tab of Catalog Explorer).
 # MAGIC
 # MAGIC **Parameters:**
 # MAGIC | Widget | Description | Example |
@@ -24,7 +24,7 @@
 # MAGIC | `target_catalog` | Catalog for import SQL generation | `target_catalog` |
 # MAGIC | `schemas` | Comma-separated schemas (empty = all) | `schema1,schema2` |
 # MAGIC | `output_volume` | UC Volume for output files | `my_catalog.my_schema.exports` |
-# MAGIC | `export_mode` | What to export: `all`, `policies_only`, `legacy_only` | `all` |
+# MAGIC | `export_mode` | What to export: `all`, `policies_only`, `rls_cls_functions` | `all` |
 # MAGIC | `apply_to_target` | Auto-apply exported policies to target catalog | `false` |
 # MAGIC | `tables_filter` | Comma-separated tables (empty = all in schema) | `table1,table2` |
 # MAGIC | `table_name_map` | Remap table names on import (`source:target` pairs) | `tbl_origin:tbl_target` |
@@ -40,7 +40,7 @@ dbutils.widgets.text("source_catalog", "", "Source Catalog")
 dbutils.widgets.text("target_catalog", "", "Target Catalog (for SQL generation)")
 dbutils.widgets.text("schemas", "", "Schemas (comma-separated, empty = all)")
 dbutils.widgets.text("output_volume", "", "Output Volume (catalog.schema.volume)")
-dbutils.widgets.dropdown("export_mode", "all", ["all", "policies_only", "legacy_only"], "Export Mode")
+dbutils.widgets.dropdown("export_mode", "all", ["all", "policies_only", "rls_cls_functions"], "Export Mode")
 dbutils.widgets.dropdown("apply_to_target", "false", ["true", "false"], "Apply to Target")
 dbutils.widgets.text("tables_filter", "", "Tables Filter (comma-separated, empty = all)")
 dbutils.widgets.text("table_name_map", "", "Table Name Map (source:target, e.g. tbl_a:tbl_b)")
@@ -197,7 +197,7 @@ if export_mode in ("all", "policies_only"):
 
     print(f"\nExported {len(exported_policies)} ABAC policies (catalog + schema + table levels)")
 else:
-    print("Skipping ABAC policies (export_mode = legacy_only)")
+    print("Skipping ABAC policies (export_mode = rls_cls_functions)")
 
 # COMMAND ----------
 
@@ -212,7 +212,7 @@ referenced_functions = set()
 row_filter_sqls = []
 column_mask_sqls = []
 
-if export_mode in ("all", "legacy_only"):
+if export_mode in ("all", "rls_cls_functions"):
     print("Exporting legacy row filters & column masks...")
     for schema_name in schemas_to_export:
         for tbl in schema_tables[schema_name]:
